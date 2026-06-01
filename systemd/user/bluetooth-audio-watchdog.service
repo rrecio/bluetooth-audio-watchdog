@@ -1,0 +1,13 @@
+[Unit]
+Description=Bluetooth audio watchdog (warns if a BT audio device connects without MediaTransport1)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/bluetooth-audio-watchdog
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,229 @@
+#!/bin/bash
+# bluetooth-audio-watchdog
+#
+# Detect audio-class Bluetooth devices that report Connected=true but never
+# establish org.bluez.MediaTransport1 (the A2DP/HFP audio transport). This is
+# the silent failure mode where BlueZ accepts a pairing made in Apple's
+# "Find-My"/setup advertising mode: AVRCP comes up, no audio sink appears in
+# PipeWire, and nothing in the stack notices.
+#
+# Tunables (env vars):
+#   BT_WATCHDOG_THRESHOLD  seconds of "connected without transport" before alert (default 15)
+#   BT_WATCHDOG_POLL       poll interval seconds (default 3)
+#   BT_WATCHDOG_AUTOFIX    1 = call Disconnect on a stuck device (default 0)
+#
+# Subcommands:
+#   --self-test    Run classify() against canned inputs; exits 0 on pass, 1 on fail.
+#   --show-all     Print the notification body produced by each branch (A B C D).
+#                  Use --show-all notify to also fire real desktop notifications.
+#   --alert <branch> <mac>
+#                  Format-and-emit a single branch as if the watchdog fired it.
+
+set -u
+
+THRESHOLD="${BT_WATCHDOG_THRESHOLD:-15}"
+POLL="${BT_WATCHDOG_POLL:-3}"
+AUTOFIX="${BT_WATCHDOG_AUTOFIX:-0}"
+
+declare -A pending  # device_path -> epoch first seen as stuck
+
+log() { echo "[bt-watchdog] $*" >&2; }
+
+list_devices() {
+    busctl tree org.bluez 2>/dev/null \
+        | grep -oE '/org/bluez/hci[0-9]+/dev_[0-9A-F_]+' \
+        | sort -u
+}
+
+dev_prop() {
+    busctl get-property org.bluez "$1" org.bluez.Device1 "$2" 2>/dev/null
+}
+
+is_connected() {
+    [[ "$(dev_prop "$1" Connected)" == "b true" ]]
+}
+
+# Audio service-class bit (0x200000) in Class, or an audio-* icon.
+is_audio() {
+    local path=$1 icon class
+    icon=$(dev_prop "$path" Icon)
+    [[ "$icon" == *audio-* ]] && return 0
+    class=$(dev_prop "$path" Class)
+    class=${class##* }
+    [[ -n "$class" && $((class & 0x200000)) -ne 0 ]]
+}
+
+has_transport() {
+    busctl --no-pager call org.bluez / \
+        org.freedesktop.DBus.ObjectManager GetManagedObjects 2>/dev/null \
+        | grep -F "$1/" | grep -q "org.bluez.MediaTransport1"
+}
+
+mac_from_path() {
+    local p=${1##*/dev_}
+    echo "${p//_/:}"
+}
+
+# --- Pure helpers (no I/O) -- driven by tests ----------------------------------
+
+# classify <bredr_paired> <le_paired> <avdtp_err_count> <avdtp_any_count>
+# Inputs are strings/ints. *_paired values come from busctl ("b true"/"b false")
+# or the looser strings carried by bearer-introspect output ("...b true..."),
+# so we match with a glob.
+# Prints one of: A B C D
+classify() {
+    local bredr_paired=$1 le_paired=$2 avdtp_err=$3 avdtp_any=$4
+    if [[ "$bredr_paired" != *true* && "$le_paired" == *true* ]]; then
+        echo A
+    elif (( avdtp_err > 0 )); then
+        echo B
+    elif (( avdtp_any == 0 )); then
+        echo C
+    else
+        echo D
+    fi
+}
+
+# format_hint <branch> <mac>  -> remediation text on stdout
+format_hint() {
+    local branch=$1 mac=$2
+    case "$branch" in
+    A)
+        printf '%s' $'Only an LE/Find-My bond exists, no BR/EDR pairing — A2DP cannot come up.\nFix: bluetoothctl remove '"$mac"$'\nthen re-pair with the AirPods in your ears and the case button held until the LED is solid WHITE.'
+        ;;
+    B)
+        printf '%s' $'Peer is rejecting the A2DP channel (avdtp Connection reset by peer).\nUsually the AirPods are held by another host (iPhone/Mac/iPad on same iCloud), are in the case, or low battery.\nFix: turn Bluetooth off on the other Apple devices (Settings, not Control Center), put AirPods in ears, then reconnect.'
+        ;;
+    C)
+        printf '%s' $'AirPods are not responding to BR/EDR — no AVDTP activity at all.\nThey are asleep in BLE Find-My beacon mode. Cause is usually another Apple device on your iCloud holding the audio profile, or AirPods sitting idle.\nFix: ensure no other Apple device is grabbing them, put them in your ears (in-ear sensor keeps them awake), then run: bluetoothctl connect '"$mac"
+        ;;
+    D)
+        printf '%s' $'A2DP/HFP did not come up despite a clean pair.\nTry: bluetoothctl disconnect '"$mac"$' ; sleep 3 ; bluetoothctl connect '"$mac"$'\nIf that fails, see journalctl -u bluetooth for the AVDTP error.'
+        ;;
+    *)
+        printf 'Unknown branch %s' "$branch"
+        ;;
+    esac
+}
+
+# emit <branch> <mac> <device-name> [send-notification]
+# send-notification defaults to 1; pass 0 to skip notify-send (useful in tests).
+emit() {
+    local branch=$1 mac=$2 name=$3 send=${4:-1}
+    local hint log_msg notif_msg display
+    display=${name:-$mac}
+    hint=$(format_hint "$branch" "$mac")
+    log_msg="[branch $branch] Bluetooth audio device '$display' is Connected but no MediaTransport1. $hint"
+    notif_msg=$'Connected, but no audio transport (A2DP/HFP).\n\n'"$hint"
+    log "$log_msg"
+    echo "$log_msg" | systemd-cat -t bt-audio-watchdog -p warning 2>/dev/null || true
+    if (( send )); then
+        notify-send -u critical -a "Bluetooth" "Audio device not working: $display" "$notif_msg" 2>/dev/null || true
+    fi
+}
+
+# --- Impure: gather evidence from the live system, then classify+emit ----------
+
+gather_and_alert() {
+    local path=$1 mac=$2
+    local raw name bredr_paired le_paired avdtp_err avdtp_any branch
+
+    raw=$(dev_prop "$path" Name)
+    name=${raw#s \"}; name=${name%\"}
+
+    bredr_paired=$(busctl introspect org.bluez "$path" 2>/dev/null \
+        | awk '/org\.bluez\.Bearer\.BREDR1/{f=1} f && /\.Paired/{print; exit}')
+    le_paired=$(busctl introspect org.bluez "$path" 2>/dev/null \
+        | awk '/org\.bluez\.Bearer\.LE1/{f=1} f && /\.Paired/{print; exit}')
+
+    avdtp_err=$(journalctl -b --since "2 min ago" -u bluetooth 2>/dev/null \
+        | grep -F "$mac" | grep -c "avdtp_connect_cb.*Connection reset")
+    avdtp_any=$(journalctl -b --since "2 min ago" -u bluetooth 2>/dev/null \
+        | grep -F "$mac" | grep -c "avdtp")
+
+    branch=$(classify "$bredr_paired" "$le_paired" "$avdtp_err" "$avdtp_any")
+    emit "$branch" "$mac" "$name" 1
+
+    if [[ "$AUTOFIX" == 1 ]]; then
+        log "AUTOFIX: Disconnect $mac"
+        busctl call org.bluez "$path" org.bluez.Device1 Disconnect >/dev/null 2>&1 || true
+    fi
+}
+
+# --- Test entrypoints ----------------------------------------------------------
+
+cmd_self_test() {
+    local fail=0
+    check() {
+        local desc=$1 expected=$2; shift 2
+        local got
+        got=$(classify "$@")
+        if [[ "$got" == "$expected" ]]; then
+            echo "ok    : $desc -> $got"
+        else
+            echo "FAIL  : $desc expected=$expected got=$got (args: $*)"; fail=1
+        fi
+    }
+    # bredr_paired, le_paired, avdtp_err, avdtp_any
+    check "LE-only bond"                            A  "b false"   "b true"    0 0
+    check "BR/EDR not paired, LE not paired"         C  "b false"   "b false"   0 0
+    check "AVDTP reset present"                      B  "b true"    "b false"   1 3
+    check "AVDTP activity but no reset, no transport" D "b true"    "b false"   0 3
+    check "no AVDTP activity at all"                 C  "b true"    "b false"   0 0
+    check "BR/EDR paired AND LE paired, reset"       B  "b true"    "b true"    2 5
+    check "BR/EDR paired AND LE paired, silent"      C  "b true"    "b true"    0 0
+    check "empty bearer outputs treated as not-paired, no log" C "" "" 0 0
+    return $fail
+}
+
+cmd_show_all() {
+    local mac="${2:-AA:BB:CC:DD:EE:FF}"
+    local send_real=0
+    [[ "${1:-}" == "notify" ]] && send_real=1
+    for b in A B C D; do
+        printf '\n=== branch %s ===\n' "$b"
+        emit "$b" "$mac" "Demo AirPods" "$send_real"
+    done
+}
+
+cmd_alert() {
+    local branch=${1:?branch required (A|B|C|D)}
+    local mac=${2:?mac required}
+    local name=${3:-$mac}
+    emit "$branch" "$mac" "$name" 1
+}
+
+# --- Entry ---------------------------------------------------------------------
+
+case "${1:-}" in
+    --self-test) shift; cmd_self_test; exit $? ;;
+    --show-all)  shift; cmd_show_all "$@"; exit 0 ;;
+    --alert)     shift; cmd_alert "$@"; exit 0 ;;
+esac
+
+# When sourced, expose helpers without running the polling loop (for tests).
+(return 0 2>/dev/null) && return 0
+
+log "starting (threshold=${THRESHOLD}s, poll=${POLL}s, autofix=${AUTOFIX})"
+
+while :; do
+    now=$(date +%s)
+    while read -r path; do
+        [[ -z "$path" ]] && continue
+        if is_connected "$path" && is_audio "$path"; then
+            if has_transport "$path"; then
+                unset "pending[$path]" 2>/dev/null || true
+            else
+                if [[ -z "${pending[$path]:-}" ]]; then
+                    pending[$path]=$now
+                elif (( now - pending[$path] >= THRESHOLD )); then
+                    gather_and_alert "$path" "$(mac_from_path "$path")"
+                    pending[$path]=$now   # rate-limit: re-alert at most once per THRESHOLD
+                fi
+            fi
+        else
+            unset "pending[$path]" 2>/dev/null || true
+        fi
+    done < <(list_devices)
+    sleep "$POLL"
+done
