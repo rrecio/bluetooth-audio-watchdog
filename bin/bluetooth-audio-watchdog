@@ -11,6 +11,16 @@
 #   BT_WATCHDOG_THRESHOLD  seconds of "connected without transport" before alert (default 15)
 #   BT_WATCHDOG_POLL       poll interval seconds (default 3)
 #   BT_WATCHDOG_AUTOFIX    1 = call Disconnect on a stuck device (default 0)
+#   BT_WATCHDOG_IGNORE     space-separated MACs to skip entirely (default "").
+#                          For multipoint devices that spend hours connected to
+#                          this host while streaming to a phone: "connected,
+#                          no transport" is their NORMAL state, and BlueZ at
+#                          default log level emits nothing that distinguishes
+#                          multipoint-idle from a dead pairing (probed
+#                          2026-09-29: zero journal lines for the MAC during a
+#                          live phone session), so per-device opt-out is the
+#                          only honest discriminator. Ignored devices get one
+#                          journal line per connected episode, nothing else.
 #
 # Subcommands:
 #   --self-test    Run classify() against canned inputs; exits 0 on pass, 1 on fail.
@@ -24,8 +34,11 @@ set -u
 THRESHOLD="${BT_WATCHDOG_THRESHOLD:-15}"
 POLL="${BT_WATCHDOG_POLL:-3}"
 AUTOFIX="${BT_WATCHDOG_AUTOFIX:-0}"
+IGNORE="${BT_WATCHDOG_IGNORE:-}"
 
-declare -A pending  # device_path -> epoch first seen as stuck
+declare -A pending       # device_path -> epoch first seen as stuck
+declare -A notified      # device_path -> branch already notified (edge trigger)
+declare -A ignored_seen  # mac -> connected episode already logged
 
 log() { echo "[bt-watchdog] $*" >&2; }
 
@@ -62,6 +75,11 @@ has_transport() {
 mac_from_path() {
     local p=${1##*/dev_}
     echo "${p//_/:}"
+}
+
+# ignore_mac <mac>: membership test against BT_WATCHDOG_IGNORE, case-insensitive.
+ignore_mac() {
+    [[ -n "$IGNORE" && " ${IGNORE,,} " == *" ${1,,} "* ]]
 }
 
 # --- Pure helpers (no I/O) -- driven by tests ----------------------------------
@@ -118,7 +136,8 @@ emit() {
     log "$log_msg"
     echo "$log_msg" | systemd-cat -t bt-audio-watchdog -p warning 2>/dev/null || true
     if (( send )); then
-        notify-send -u critical -a "Bluetooth" "Audio device not working: $display" "$notif_msg" 2>/dev/null || true
+        # Fixed replace-id: update the existing notification instead of stacking
+        notify-send -r 4500 -u critical -a "Bluetooth" "Audio device not working: $display" "$notif_msg" 2>/dev/null || true
     fi
 }
 
@@ -142,7 +161,16 @@ gather_and_alert() {
         | grep -F "$mac" | grep -c "avdtp")
 
     branch=$(classify "$bredr_paired" "$le_paired" "$avdtp_err" "$avdtp_any")
-    emit "$branch" "$mac" "$name" 1
+
+    # Edge-triggered desktop notification: fire on onset and on branch change
+    # only. notify-send -r replaces a LIVE notification, but a critical banner
+    # never expires; once the user dismisses it the next emit starts a new one
+    # and the message tray fills with one copy per dismissal. Journal logging
+    # (inside emit) keeps its per-THRESHOLD cadence either way.
+    local send=1
+    [[ "${notified[$path]:-}" == "$branch" ]] && send=0
+    notified[$path]=$branch
+    emit "$branch" "$mac" "$name" "$send"
 
     if [[ "$AUTOFIX" == 1 ]]; then
         log "AUTOFIX: Disconnect $mac"
@@ -210,19 +238,36 @@ while :; do
     now=$(date +%s)
     while read -r path; do
         [[ -z "$path" ]] && continue
+        mac=$(mac_from_path "$path")
+        if ignore_mac "$mac"; then
+            if is_connected "$path"; then
+                if [[ -z "${ignored_seen[$mac]:-}" ]]; then
+                    ignored_seen[$mac]=1
+                    log "ignoring $mac (BT_WATCHDOG_IGNORE; multipoint-with-phone is a normal no-transport state)"
+                fi
+            else
+                # Known cosmetic leak: if the device object vanishes from the
+                # busctl tree without a Connected transition (adapter off,
+                # unpair, bluetoothd restart) this unset never runs and the
+                # next episode logs no "ignoring" line. Bounded by the ignore
+                # list, no alert impact.
+                unset "ignored_seen[$mac]" 2>/dev/null || true
+            fi
+            continue
+        fi
         if is_connected "$path" && is_audio "$path"; then
             if has_transport "$path"; then
-                unset "pending[$path]" 2>/dev/null || true
+                unset "pending[$path]" "notified[$path]" 2>/dev/null || true
             else
                 if [[ -z "${pending[$path]:-}" ]]; then
                     pending[$path]=$now
                 elif (( now - pending[$path] >= THRESHOLD )); then
-                    gather_and_alert "$path" "$(mac_from_path "$path")"
+                    gather_and_alert "$path" "$mac"
                     pending[$path]=$now   # rate-limit: re-alert at most once per THRESHOLD
                 fi
             fi
         else
-            unset "pending[$path]" 2>/dev/null || true
+            unset "pending[$path]" "notified[$path]" 2>/dev/null || true
         fi
     done < <(list_devices)
     sleep "$POLL"
